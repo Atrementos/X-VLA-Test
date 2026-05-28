@@ -80,6 +80,7 @@ def get_args_parser():
     # Data
     parser.add_argument("--train_metas_path", type=str, required=True, help="Path to training metadata")
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Steps before updating weights")
 
     # Optimizer
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -181,7 +182,8 @@ def main(args):
     output_dir = Path(args.output_dir)
     accelerator = Accelerator(
         log_with="tensorboard", 
-        project_dir=output_dir
+        project_dir=output_dir,
+        gradient_accumulation_steps=args.gradient_accumulation_steps
     )
     accelerator.init_trackers("XVLA-Training")
     
@@ -195,8 +197,8 @@ def main(args):
     model = XVLA.from_pretrained(args.models)
     
     lora_config = LoraConfig(
-        lora_alpha=16,
-        r=8,
+        lora_alpha=32,
+        r=32,
         bias="none",
         target_modules="all-linear",
         modules_to_save=["transformer.soft_prompt_hub", 
@@ -241,47 +243,48 @@ def main(args):
         lang = processor.encode_language(batch["language_instruction"])
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
-        inputs = {k: v.cuda(non_blocking=True) for k, v in inputs.items()}
+        inputs = {k: v.to(accelerator.device, non_blocking=True) for k, v in inputs.items()}
         # Update LR per group
         update_group_lrs(optim, global_step, args)
 
-        # Forward & backward
-        loss_dict: Dict[str, torch.Tensor] = model(**inputs)
-        loss = sum(loss_dict.values())
-        accelerator.backward(loss)
-        if args.max_grad_norm:
-            accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-        optim.step()
-        optim.zero_grad()
+        with accelerator.accumulate(model):
+            loss_dict: Dict[str, torch.Tensor] = model(**inputs)
+            loss = sum(loss_dict.values())
+            accelerator.backward(loss)
+            if args.max_grad_norm:
+                accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optim.step()
+            optim.zero_grad()
 
-        # Logging
-        if global_step % args.log_interval == 0:
-            logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
-            logs["loss_total"] = float(loss.detach().item())
-            logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
-            accelerator.log(logs, step=global_step)
+        # Step and log logic bounds tightly to synchronization transitions
+        if accelerator.sync_gradients:
+            if global_step % args.log_interval == 0:
+                logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
+                logs["loss_total"] = float(loss.detach().item())
+                logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
+                accelerator.log(logs, step=global_step)
 
+                if accelerator.is_main_process:
+                    dt = (time.time() - t0) / args.log_interval
+                    t0 = time.time()
+                    logger.info(
+                        f"[{global_step}/{args.iters}] "
+                        f"loss={logs['loss_total']:.4f} "
+                        f"lr_core={logs['lr_transformer_core']:.2e} "
+                        f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
+                    )
+            
+            global_step += 1
             if accelerator.is_main_process:
-                dt = (time.time() - t0) / args.log_interval
-                t0 = time.time()
-                logger.info(
-                    f"[{global_step}/{args.iters}] "
-                    f"loss={logs['loss_total']:.4f} "
-                    f"lr_core={logs['lr_transformer_core']:.2e} "
-                    f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
-                )
-        
-        # Checkpointing
-        global_step += 1
-        if accelerator.is_main_process:
-            if global_step == args.iters or global_step % args.save_interval == 0:
-                save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
-                accelerator.print(f"💾 Saving model to {save_dir}")
-                accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
-                with open(os.path.join(save_dir, "state.json"), "w") as f:
-                    json.dump({"global_step": global_step}, f)
-        
-        if global_step >= args.iters: break
+                if global_step == args.iters or global_step % args.save_interval == 0:
+                    save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
+                    accelerator.print(f"💾 Saving model adapters to {save_dir}")
+                    accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
+                    with open(os.path.join(save_dir, "state.json"), "w") as f:
+                        json.dump({"global_step": global_step}, f)
+            
+            if global_step >= args.iters: 
+                break
 
     accelerator.end_training()
 
