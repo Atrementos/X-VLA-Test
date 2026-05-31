@@ -27,38 +27,37 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
+from torch.utils.tensorboard import SummaryWriter
 
-from accelerate import Accelerator
 from datasets import create_dataloader
 from models.modeling_xvla import XVLA
 from models.processing_xvla import XVLAProcessor
 from peft import LoraConfig, get_peft_model
 
-
-
 import logging
-import os
 import sys
+import psutil
 
 # ============================================================
 # logger
 # ============================================================
-def get_logger(name="train", output_dir=None, accelerator=None, level=logging.INFO):
+def get_logger(name="train", output_dir=None, level=logging.INFO):
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.propagate = False 
     if logger.handlers:
         return logger
-    is_main = accelerator is None or accelerator.is_main_process
+    
     fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     datefmt = "%H:%M:%S"
     formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
-    if is_main:
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setFormatter(formatter)
-        ch.setLevel(level)
-        logger.addHandler(ch)
-    if output_dir and is_main:
+    
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(formatter)
+    ch.setLevel(level)
+    logger.addHandler(ch)
+    
+    if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         fh = logging.FileHandler(os.path.join(output_dir, "train.log"), mode="a")
         fh.setFormatter(formatter)
@@ -111,6 +110,7 @@ def get_args_parser():
 # ============================================================
 def set_seed(seed: int):
     torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     cudnn.benchmark = True
@@ -180,38 +180,44 @@ def update_group_lrs(optim, step, args):
 # ============================================================
 def main(args):
     output_dir = Path(args.output_dir)
-    accelerator = Accelerator(
-        log_with="tensorboard", 
-        project_dir=output_dir,
-        gradient_accumulation_steps=args.gradient_accumulation_steps
-    )
-    accelerator.init_trackers("XVLA-Training")
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    accelerator.wait_for_everyone()
-    logger = get_logger(__name__, output_dir=output_dir, accelerator=accelerator)
+    writer = SummaryWriter(log_dir=os.path.join(output_dir, "XVLA-PEFT-Training"))
+    logger = get_logger(__name__, output_dir=output_dir)
     
-    set_seed(args.seed + accelerator.process_index)
+    set_seed(args.seed)
     logger.info(f"Args: {args}")
 
-    # Load model & processor
-    model = XVLA.from_pretrained(args.models)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    # Load base model in bfloat16 to optimize memory allocation right away
+    logger.info("Loading base model in torch.bfloat16...")
+    model = XVLA.from_pretrained(args.models, torch_dtype=torch.bfloat16)
     
     lora_config = LoraConfig(
         lora_alpha=32,
         r=32,
         bias="none",
         target_modules="all-linear",
-        modules_to_save=["transformer.soft_prompt_hub", 
-                         "transformer.action_encoder", 
-                         "transformer.action_decoder"],
+        modules_to_save=[
+            "transformer.soft_prompt_hub", 
+            "transformer.action_encoder", 
+            "transformer.action_decoder"
+        ],
     )
     model = get_peft_model(model, lora_config)
+    
+    # CRITICAL PEFT STEP: Ensure adapters and custom heads stay in float32 for high-precision updates
+    for name, param in model.named_parameters():
+        if any(m in name for m in ["lora_", "soft_prompt_hub", "action_encoder", "action_decoder"]):
+            param.data = param.data.to(torch.float32)
+            
     model.print_trainable_parameters()
     
-    
     processor = XVLAProcessor.from_pretrained(args.models)
+    model.to(device)
 
-    # Iterable dataloader (don't wrap with prepare)
     train_dataloader = create_dataloader(
         batch_size=args.batch_size,
         metas_path=args.train_metas_path,
@@ -220,7 +226,6 @@ def main(args):
         training=True,
     )
 
-    # Optimizer
     optim = build_optimizer(
         model=model,
         lr=args.learning_rate,
@@ -228,72 +233,75 @@ def main(args):
         betas=tuple(args.betas),
         lr_coef_soft=args.learning_coef,
     )
-    model, optim = accelerator.prepare(model, optim)
 
-
-    # Training loop
     model.train()
-    global_step, t0 = 0, time.time()
-    logger.info(f"🚀 Start training for {args.iters} iterations | world_size={accelerator.num_processes}")
+    global_step, accumulation_step, t0 = 0, 0, time.time()
+    logger.info(f"🚀 Start PEFT bfloat16 AMP training for {args.iters} iterations")
     
-    
+    optim.zero_grad()
     
     for batch in train_dataloader:
-        # Encode language
         lang = processor.encode_language(batch["language_instruction"])
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
-        inputs = {k: v.to(accelerator.device, non_blocking=True) for k, v in inputs.items()}
-        # Update LR per group
+        
+        inputs = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         update_group_lrs(optim, global_step, args)
 
-        with accelerator.accumulate(model):
+        # PyTorch Native Automatic Mixed Precision Context for bfloat16
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             loss_dict: Dict[str, torch.Tensor] = model(**inputs)
             loss = sum(loss_dict.values())
-            accelerator.backward(loss)
+            loss = loss / args.gradient_accumulation_steps
+            
+        loss.backward()
+        accumulation_step += 1
+
+        if accumulation_step % args.gradient_accumulation_steps == 0:
             if args.max_grad_norm:
-                accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            
             optim.step()
             optim.zero_grad()
-
-        # Step and log logic bounds tightly to synchronization transitions
-        if accelerator.sync_gradients:
+            
             if global_step % args.log_interval == 0:
                 logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
-                logs["loss_total"] = float(loss.detach().item())
+                logs["loss_total"] = float(loss.detach().item()) * args.gradient_accumulation_steps
                 logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
-                accelerator.log(logs, step=global_step)
+                
+                for k, v in logs.items():
+                    writer.add_scalar(k, v, global_step)
 
-                if accelerator.is_main_process:
-                    dt = (time.time() - t0) / args.log_interval
-                    t0 = time.time()
-                    logger.info(
-                        f"[{global_step}/{args.iters}] "
-                        f"loss={logs['loss_total']:.4f} "
-                        f"lr_core={logs['lr_transformer_core']:.2e} "
-                        f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
-                    )
+                dt = (time.time() - t0) / args.log_interval
+                t0 = time.time()
+                cpu_mem = psutil.Process(os.getpid()).memory_info().rss / 1024**3
+                gpu_mem = torch.cuda.memory_allocated() / 1024**3
+                
+                logger.info(
+                    f"[{global_step}/{args.iters}] "
+                    f"loss={logs['loss_total']:.4f} "
+                    f"lr_core={logs['lr_transformer_core']:.2e} "
+                    f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it) "
+                    f"USED_CPU={cpu_mem:.2f} GB "
+                    f"USED_GPU={gpu_mem:.2f} GB "
+                )
             
             global_step += 1
-            if accelerator.is_main_process:
-                if global_step == args.iters or global_step % args.save_interval == 0:
-                    save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
-                    accelerator.print(f"💾 Saving model adapters to {save_dir}")
-                    accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
-                    with open(os.path.join(save_dir, "state.json"), "w") as f:
-                        json.dump({"global_step": global_step}, f)
+            
+            if global_step == args.iters or global_step % args.save_interval == 0:
+                save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
+                print(f"💾 Saving model adapters to {save_dir}")
+                model.save_pretrained(save_dir, safe_serialization=True)
+                with open(os.path.join(save_dir, "state.json"), "w") as f:
+                    json.dump({"global_step": global_step}, f)
             
             if global_step >= args.iters: 
                 break
 
-    accelerator.end_training()
+    writer.close()
 
-# ============================================================
-# Entry
-# ============================================================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("XVLA training script", parents=[get_args_parser()])
     args = parser.parse_args()
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
