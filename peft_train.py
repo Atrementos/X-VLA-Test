@@ -76,6 +76,7 @@ def get_args_parser():
     # I/O
     parser.add_argument("--models", type=str, required=True, help="Path or HF repo for pretrained XVLA")
     parser.add_argument("--output_dir", type=str, default="runnings", help="Directory to save checkpoints")
+    parser.add_argument("--loss_output_dir", type=str, default="runnings", help="Directory to save loss history")
 
     # Data
     parser.add_argument("--train_metas_path", type=str, required=True, help="Path to training metadata")
@@ -241,6 +242,9 @@ def main(args):
 
     torch.cuda.synchronize()
     start_energy = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle)
+
+    loss_history = []
+    loss_history_path = os.path.join(args.loss_output_dir, "loss_history.json")
     
     for batch in train_dataloader:
         # Encode language
@@ -291,6 +295,9 @@ def main(args):
                 break
 
     accelerator.end_training()
+
+    with open(loss_history_path, "w") as f:
+        json.dump(loss_history, f, indent=2)
 
     torch.cuda.synchronize()
     end_energy = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle)
