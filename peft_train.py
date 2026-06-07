@@ -34,11 +34,11 @@ from models.modeling_xvla import XVLA
 from models.processing_xvla import XVLAProcessor
 from peft import LoraConfig, get_peft_model
 
-
-
 import logging
 import os
 import sys
+
+import pynvml 
 
 # ============================================================
 # logger
@@ -197,8 +197,8 @@ def main(args):
     model = XVLA.from_pretrained(args.models)
     
     lora_config = LoraConfig(
-        lora_alpha=32,
-        r=32,
+        lora_alpha=16,
+        r=8,
         bias="none",
         target_modules="all-linear",
         modules_to_save=["transformer.soft_prompt_hub", 
@@ -236,7 +236,11 @@ def main(args):
     global_step, t0 = 0, time.time()
     logger.info(f"🚀 Start training for {args.iters} iterations | world_size={accelerator.num_processes}")
     
-    
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    torch.cuda.synchronize()
+    start_energy = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle)
     
     for batch in train_dataloader:
         # Encode language
@@ -287,6 +291,12 @@ def main(args):
                 break
 
     accelerator.end_training()
+
+    torch.cuda.synchronize()
+    end_energy = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle)
+
+    print(f"Total Energy Consumption: {(end_energy - start_energy) / 1000.0} Joules")
+    pynvml.nvmlShutdown()
 
 # ============================================================
 # Entry

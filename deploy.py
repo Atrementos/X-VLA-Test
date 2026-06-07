@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", type=str,
                         help="Host address for FastAPI server")
     parser.add_argument("--disable_slurm", action="store_true", default=False)
+    parser.add_argument("--timing_path", type=str, default=None)
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -77,7 +78,8 @@ def main():
         model = XVLA.from_pretrained(
             args.model_path,
             trust_remote_code=True,
-            torch_dtype=torch.float32
+            torch_dtype=torch.float32,
+            timing_path=args.timing_path,
         ).to(device).to(torch.float32)
         
         if args.LoRA_path is not None:
@@ -143,6 +145,14 @@ def main():
     except Exception as e:
         print(f"⚠️ Failed to write {info_path}: {e}")
         sys.exit(1)
+
+    if args.timing_path is not None:
+        try:
+            with open(args.timing_path, "w", encoding="utf-8") as f:
+                f.write("") 
+            logging.info(f"⏱️ Cleared previous logs. Writing new timings to: {args.timing_path}")
+        except Exception as e:
+            logging.error(f"⚠️ Could not initialize timing log file: {e}")
 
     # --------------------------------------------------------------------------
     # Launch FastAPI server

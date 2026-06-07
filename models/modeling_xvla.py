@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import traceback
+import time
 from typing import Any, Dict
 
 import numpy as np
@@ -35,6 +36,30 @@ from .transformer import SoftPromptedTransformer
 from .action_hub import build_action_space
 from .configuration_xvla import XVLAConfig
 
+import json
+
+class InferenceTimer:
+    def __init__(self, timing_path: str | None):
+        self.timing_path = timing_path
+        self.start_time = None
+
+    def __enter__(self):
+        if self.timing_path is not None:
+            torch.cuda.synchronize()
+            self.start_time = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.timing_path is not None and self.start_time is not None:
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - self.start_time
+            
+            log_entry = json.dumps({"timestamp": time.time(), "latency_sec": elapsed})
+            try:
+                with open(self.timing_path, "a", encoding="utf-8") as f:
+                    f.write(log_entry + "\n")
+            except Exception:
+                pass
 
 class XVLA(PreTrainedModel):
     """
@@ -52,6 +77,7 @@ class XVLA(PreTrainedModel):
     def __init__(self, config: XVLAConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
 
+        self.timing_path = kwargs.get("timing_path", None)
         # Core settings
         self.num_actions: int = config.num_actions
         self.use_proprio: bool = config.use_proprio
@@ -193,6 +219,7 @@ class XVLA(PreTrainedModel):
         Applies action_space.postprocess at the end (e.g., sigmoid on gripper).
         """
         self.eval()
+
         enc = self.forward_vlm(input_ids, image_input, image_mask)
 
         B = input_ids.shape[0]
@@ -213,7 +240,9 @@ class XVLA(PreTrainedModel):
                 t=t,
                 **enc,
             )
-        return self.action_space.postprocess(action)
+        generated_actions = self.action_space.postprocess(action)
+
+        return generated_actions
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):
@@ -276,7 +305,9 @@ class XVLA(PreTrainedModel):
 
                 # Inference
                 steps = int(payload.get("steps", 10))
-                action = self.generate_actions(**inputs, steps=steps).squeeze(0).float().cpu().numpy()
+                with InferenceTimer(timing_path=self.timing_path):
+                    action = self.generate_actions(**inputs, steps=steps).squeeze(0).float().cpu().numpy()
+
                 return JSONResponse({"action": action.tolist()})
 
             except Exception:

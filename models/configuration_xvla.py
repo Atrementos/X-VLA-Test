@@ -54,6 +54,9 @@ class XVLAConfig(PretrainedConfig):
         action_mode: str = "ee6d",
         use_proprio: bool = True,
 
+        # === Timing (for inference) ===
+        timing_path: str | None = None,
+
         **kwargs,
     ):
         # Florence2 backbone configuration

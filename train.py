@@ -37,6 +37,8 @@ import logging
 import sys
 import psutil
 
+import pynvml 
+
 # ============================================================
 # logger
 # ============================================================
@@ -218,6 +220,13 @@ def main(args):
     global_step, t0 = 0, time.time()
     logger.info(f"🚀 Start training for {args.iters} iterations | world_size={accelerator.num_processes}")
     
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    torch.cuda.synchronize()
+    start_energy = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle)
+
+
     for batch in train_dataloader:
         # Encode language
         lang = processor.encode_language(batch["language_instruction"])
@@ -275,6 +284,12 @@ def main(args):
                 break
 
     accelerator.end_training()
+
+    torch.cuda.synchronize()
+    end_energy = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle)
+
+    print(f"Total Energy Consumption: {(end_energy - start_energy) / 1000.0} Joules")
+    pynvml.nvmlShutdown()
 
 # ============================================================
 # Entry

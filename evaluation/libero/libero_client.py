@@ -290,6 +290,13 @@ class LIBEROEval:
         env, lang, obs = self._init_env(task_suite, task_id, ep)
         images: List[np.ndarray] = []
 
+        if not hasattr(self, 'total_sim_time'):
+            self.total_sim_time = 0.0
+            self.total_sim_steps = 0
+
+        ep_sim_time = 0.0
+        ep_sim_steps = 0
+
         done_flag = False
         for _ in tqdm(range(self.eval_horizon), desc=f'{lang}'):
             robo_ori = self.processor.Mat_to_Rotate6D(env.env.robots[0].controller.ee_ori_mat)
@@ -300,10 +307,29 @@ class LIBEROEval:
             action = policy.step(obs, lang)
 
             images.append(_flip_agentview(obs['agentview_image']))
+
+            t_start = time.perf_counter()
             obs, reward, done, info = env.step(action)
+            t_end = time.perf_counter()
+
+            step_duration = t_end - t_start
+            
+            # Accumulate local episode metrics
+            ep_sim_time += step_duration
+            ep_sim_steps += 1
+            
+            # Accumulate global cumulative metrics
+            self.total_sim_time += step_duration
+            self.total_sim_steps += 1
+
             if done:
                 done_flag = True
                 break
+
+        if ep_sim_steps > 0:
+            ep_avg_step = ep_sim_time / ep_sim_steps
+            print(f"   🎬 [Episode {ep} Done] Total Sim Time: {ep_sim_time:.3f}s | "
+                  f"Avg Step Time: {ep_avg_step * 1000:.2f} ms ({1.0 / ep_avg_step:.1f} Hz)")
 
         save_path = self.base_dir / f"{lang}_{ep}.mp4"
         self._save_video(save_path, images, fps=30)
@@ -319,6 +345,9 @@ class LIBEROEval:
     def eval_episodes(self, policy: ClientModel, save_path: Path) -> float:
         self._make_dir(save_path)
 
+        self.total_sim_time = 0.0
+        self.total_sim_steps = 0
+
         rews: List[float] = []
         for task_suite in self.task_suite_list:
             for task_id in tqdm(range(len(task_suite.tasks)), desc="Evaluating tasks"):
@@ -330,6 +359,17 @@ class LIBEROEval:
         eval_rewards = float(sum(rews) / max(len(rews), 1))
         metrics = {f'sim_summary/{self.task_suite_name}/all': eval_rewards}
         self._log_results(metrics)
+
+        if self.total_sim_steps > 0:
+            global_avg_step = self.total_sim_time / self.total_sim_steps
+            print("\n" + "🏆" * 25)
+            print(f"📊  [FINAL CUMULATIVE SIMULATION PROFILE - {self.task_suite_name}]")
+            print(f"🔸 Total Episodes Processed : {len(rews)}")
+            print(f"🔸 Total Combined Sim Steps : {self.total_sim_steps}")
+            print(f"🔸 Total Simulation Time    : {self.total_sim_time:.3f} seconds")
+            print(f"🔥 Grand Average Step Time  : {global_avg_step * 1000:.2f} ms ({1.0 / global_avg_step:.1f} Hz)")
+            print("🏆" * 25 + "\n")
+            
         return eval_rewards
 
 

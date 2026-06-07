@@ -75,8 +75,8 @@ class InfiniteDataReader(IterableDataset):
 
         self.image_aug = [
             transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.) \
-                if training else transforms.Lambda(lambda x: x),
+            # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.) \
+            #     if training else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=True),
         ]
